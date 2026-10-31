@@ -36,6 +36,101 @@ deploy/
   nginx-taskflow.conf  Nginx reverse proxy config
 ```
 
+## Architecture
+
+### Components
+
+How a request travels from the user's browser to PostgreSQL and back:
+
+```mermaid
+flowchart TB
+    U(["User"]) --> B["Browser<br/>index.html + Bootstrap 5"]
+    B -- "HTTP :80<br/>GET page / POST form" --> N["Nginx<br/>reverse proxy"]
+    N -- "/static/* served<br/>directly from disk" --> B
+    N -- "proxy_pass<br/>+ X-Forwarded-* headers" --> G["Gunicorn<br/>127.0.0.1:8000<br/>2 workers"]
+    G -- "WSGI" --> P
+
+    subgraph FLASK["Flask app (app/)"]
+        direction LR
+        P["ProxyFix<br/>restores client IP + scheme"] --> R["routes.py<br/>Blueprint 'main'"]
+        R --> V["validate_task_form()"]
+        R --> T["Jinja2 templates<br/>base.html, index.html"]
+        R --> M["models.py<br/>Task model"]
+    end
+
+    M -- "SQLAlchemy ORM<br/>(Flask-SQLAlchemy)" --> D["psycopg 3 driver<br/>connection pool + pre-ping"]
+    D -- "SQL over TCP<br/>127.0.0.1:5432" --> DB[("PostgreSQL 16<br/>tasks table")]
+```
+
+### CRUD request lifecycle
+
+Every change uses the **Post/Redirect/Get** pattern: the browser POSTs a form,
+the app writes to the database and answers with a redirect, and the browser
+then GETs the refreshed list. Refreshing the page therefore never submits a
+form twice. Example: adding a task.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant Browser
+    participant Nginx
+    participant Gunicorn
+    participant Flask as Flask (routes.py)
+    participant ORM as SQLAlchemy + psycopg
+    participant DB as PostgreSQL
+
+    User->>Browser: Fill in the form and click "Add task"
+    Browser->>Nginx: POST /tasks (title, description, priority, filter)
+    Nginx->>Gunicorn: proxy_pass with X-Forwarded-For / Proto / Host
+    Gunicorn->>Flask: WSGI call to create_task()
+    Flask->>Flask: validate_task_form()
+
+    alt Invalid input
+        Flask->>ORM: Task.query (list) and 3 count() queries
+        ORM->>DB: SELECT ... FROM tasks
+        DB-->>ORM: rows
+        Flask-->>Browser: 400 index.html with error list, user's input kept
+    else Valid input
+        Flask->>ORM: db.session.add(task) and commit()
+        ORM->>DB: INSERT INTO tasks ... RETURNING id
+        DB-->>ORM: new id
+        Flask-->>Browser: 302 redirect to /?filter=all + flash "Task added."
+        Browser->>Nginx: GET /?filter=all
+        Nginx->>Gunicorn: proxy_pass
+        Gunicorn->>Flask: index()
+        Flask->>ORM: Task.query (filtered, newest first) and 3 count() queries
+        ORM->>DB: SELECT ... ORDER BY created_at DESC, SELECT count(*)
+        DB-->>ORM: rows
+        Flask-->>Browser: 200 index.html rendered by Jinja2 (list, counts, flash)
+    end
+
+    Note over Browser,Flask: Responses travel back through Gunicorn and Nginx
+    Browser-->>User: Updated task list
+```
+
+Edit, toggle and delete follow the same POST, commit, 302, GET shape; only
+the route and the SQL differ:
+
+| Action           | Browser request            | Route function   | ORM operation                                         | SQL sent to PostgreSQL                         |
+|------------------|----------------------------|------------------|-------------------------------------------------------|------------------------------------------------|
+| View / filter    | `GET /?filter=pending`     | `index()`        | `Task.query.filter_by(completed=False)...all()` + counts | `SELECT ... WHERE completed = false ORDER BY created_at DESC` |
+| Create           | `POST /tasks`              | `create_task()`  | `db.session.add(task)`, `commit()`                    | `INSERT INTO tasks ... RETURNING id`           |
+| Open edit form   | `GET /tasks/<id>/edit`     | `edit_task()`    | `db.get_or_404(Task, id)`                             | `SELECT ... WHERE id = ?`                      |
+| Update           | `POST /tasks/<id>/edit`    | `edit_task()`    | load task, set fields, `commit()`                     | `SELECT` by id, then `UPDATE tasks SET title, description, priority` |
+| Complete/pending | `POST /tasks/<id>/toggle`  | `toggle_task()`  | load task, flip `completed`, `commit()`               | `SELECT` by id, then `UPDATE tasks SET completed` |
+| Delete           | `POST /tasks/<id>/delete`  | `delete_task()`  | load task, `db.session.delete(task)`, `commit()`      | `SELECT` by id, then `DELETE FROM tasks WHERE id = ?` |
+
+Error paths:
+
+- **Invalid input** (empty or too-long title, unknown priority): HTTP 400; the
+  form is shown again with the errors and nothing is written.
+- **Unknown task id**: `db.get_or_404` returns HTTP 404 (`error.html`).
+- **GET on a write route** (e.g. opening `/tasks/1/delete` in the address bar): HTTP 405.
+- **Database unavailable or query failure**: the `SQLAlchemyError` handler
+  rolls back the session, logs the error and returns HTTP 503 (`error.html`).
+- **Delete** asks for confirmation in the browser (`confirm()`) before the form is submitted.
+
 ## Database schema
 
 Table `tasks` (created automatically on startup):
