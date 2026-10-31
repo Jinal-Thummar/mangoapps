@@ -184,7 +184,7 @@ psql -U taskflow -h localhost taskflow -c "SELECT id, title, priority, completed
 ### Architecture
 
 ```
-Internet ──► Security group (80 open, 22 admin IP only)
+Internet ──► Security group (80 open, 22 open: SSH key-only)
                │
                ▼
         EC2 t3.micro · Ubuntu 24.04
@@ -210,6 +210,12 @@ load balancer or Elastic IP.
   `setup_server.sh` and stored in `/etc/taskflow/taskflow.env`
   (`root:taskflow`, mode 640). They are never in git.
 - PostgreSQL uses password (`scram-sha-256`) authentication.
+- SSH (port 22) is open to any IP so the server can be managed from any
+  network. sshd accepts **key-based logins only** (password and root password
+  login are disabled in the Ubuntu AMI), so access requires
+  `taskflow-key.pem`. Automated scanners will hit port 22 and fail; these
+  attempts show up in `journalctl -u ssh`. For tighter security, restrict the
+  rule to your own IP (`CidrIp=<your-ip>/32`).
 - `postgresql`, `taskflow` and `nginx` are enabled systemd services, so
   everything starts automatically after a reboot; Gunicorn restarts on crash.
 - Data lives on the instance's EBS volume and survives app restarts,
@@ -219,7 +225,6 @@ load balancer or Elastic IP.
 
 ```bash
 REGION=us-east-2
-MYIP=$(curl -s https://checkip.amazonaws.com)
 VPC=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text)
 AMI=$(aws ec2 describe-images --owners 099720109477 \
   --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
@@ -229,11 +234,11 @@ AMI=$(aws ec2 describe-images --owners 099720109477 \
 aws ec2 create-key-pair --key-name taskflow-key --query KeyMaterial --output text > ~/.ssh/taskflow-key.pem
 chmod 400 ~/.ssh/taskflow-key.pem
 
-# Security group: SSH from your IP only, HTTP from anywhere
+# Security group: SSH and HTTP from anywhere (SSH is key-only on the server)
 SG=$(aws ec2 create-security-group --group-name taskflow-sg \
   --description "TaskFlow web server" --vpc-id $VPC --query GroupId --output text)
 aws ec2 authorize-security-group-ingress --group-id $SG --ip-permissions \
-  "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$MYIP/32}]" \
+  "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=0.0.0.0/0}]" \
   "IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0}]"
 
 # EC2 instance (encrypted 20 GB gp3 disk, IMDSv2 required)
