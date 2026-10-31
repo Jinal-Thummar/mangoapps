@@ -37,10 +37,10 @@ flowchart TB
 ```
 
 Each arrow is two-way: the request travels down to the database, and the
-response travels back up the same path to the browser. Only Nginx is
-reachable from the internet. Gunicorn and PostgreSQL listen on localhost, so
-the database is never exposed. Nginx serves CSS itself and passes everything
-else to Gunicorn, which runs the Flask app.
+response travels back up the same path to the browser. Only Nginx (port 80)
+and SSH (port 22, key-only) are reachable from the internet. Gunicorn and
+PostgreSQL listen on localhost, so the database is never exposed. Nginx serves
+CSS itself and passes everything else to Gunicorn, which runs the Flask app.
 
 ### How a request travels: adding a task
 
