@@ -30,6 +30,10 @@ run.py                 Entry point (python run.py / gunicorn run:app)
 requirements.txt
 .env.example           Template for your local .env file
 pytest.ini
+deploy/
+  setup_server.sh      One-command server setup / redeploy (Ubuntu 24.04)
+  taskflow.service     systemd unit running Gunicorn
+  nginx-taskflow.conf  Nginx reverse proxy config
 ```
 
 ## Database schema
@@ -175,31 +179,108 @@ psql -U taskflow -h localhost taskflow -c "SELECT id, title, priority, completed
 
 ---
 
-## Nginx reverse proxy (reference)
+## AWS deployment (single EC2 instance)
 
-Gunicorn should listen only on `127.0.0.1`; Nginx is the public entry point.
-The app uses Werkzeug's `ProxyFix`, so it trusts these forwarded headers from
-one proxy hop:
+### Architecture
 
-```nginx
-server {
-    listen 80;
-    server_name _;
-
-    location / {
-        proxy_pass         http://127.0.0.1:8000;
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-    }
-
-    location = /health {
-        proxy_pass http://127.0.0.1:8000/health;
-        access_log off;
-    }
-}
 ```
+Internet ──► Security group (80 open, 22 admin IP only)
+               │
+               ▼
+        EC2 t3.micro · Ubuntu 24.04
+        ┌──────────────────────────────────────────┐
+        │ Nginx :80  ──►  Gunicorn 127.0.0.1:8000   │
+        │ (static files,     (systemd: taskflow,     │
+        │  security headers)  2 workers, user        │
+        │                     `taskflow`)            │
+        │                        │                   │
+        │                        ▼                   │
+        │            PostgreSQL 16 127.0.0.1:5432    │
+        │            (data on encrypted EBS volume)  │
+        └──────────────────────────────────────────┘
+```
+
+AWS resources: **1 EC2 instance, 1 security group, 1 key pair.** No RDS,
+load balancer or Elastic IP.
+
+- Gunicorn and PostgreSQL listen on localhost only; Nginx is the only public
+  service. The app uses Werkzeug's `ProxyFix` to trust Nginx's
+  `X-Forwarded-*` headers (one proxy hop).
+- Secrets (`SECRET_KEY`, DB password) are generated **on the server** by
+  `setup_server.sh` and stored in `/etc/taskflow/taskflow.env`
+  (`root:taskflow`, mode 640). They are never in git.
+- PostgreSQL uses password (`scram-sha-256`) authentication.
+- `postgresql`, `taskflow` and `nginx` are enabled systemd services, so
+  everything starts automatically after a reboot; Gunicorn restarts on crash.
+- Data lives on the instance's EBS volume and survives app restarts,
+  database restarts and instance reboots.
+
+### Create the infrastructure (AWS CLI)
+
+```bash
+REGION=us-east-2
+MYIP=$(curl -s https://checkip.amazonaws.com)
+VPC=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text)
+AMI=$(aws ec2 describe-images --owners 099720109477 \
+  --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
+  --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)
+
+# Key pair (skip if you already have one)
+aws ec2 create-key-pair --key-name taskflow-key --query KeyMaterial --output text > ~/.ssh/taskflow-key.pem
+chmod 400 ~/.ssh/taskflow-key.pem
+
+# Security group: SSH from your IP only, HTTP from anywhere
+SG=$(aws ec2 create-security-group --group-name taskflow-sg \
+  --description "TaskFlow web server" --vpc-id $VPC --query GroupId --output text)
+aws ec2 authorize-security-group-ingress --group-id $SG --ip-permissions \
+  "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$MYIP/32}]" \
+  "IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0}]"
+
+# EC2 instance (encrypted 20 GB gp3 disk, IMDSv2 required)
+aws ec2 run-instances --image-id $AMI --instance-type t3.micro --key-name taskflow-key \
+  --security-group-ids $SG \
+  --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","Encrypted":true}}]' \
+  --metadata-options HttpTokens=required \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=taskflow}]'
+```
+
+### Deploy / redeploy
+
+```bash
+ssh -i ~/.ssh/taskflow-key.pem ubuntu@<EC2_PUBLIC_IP>
+curl -fsSL https://raw.githubusercontent.com/Jinal-Thummar/mangoapps/main/deploy/setup_server.sh -o setup_server.sh
+REPO_URL=https://github.com/Jinal-Thummar/mangoapps.git bash setup_server.sh
+```
+
+The script is idempotent: run it again after `git push` to deploy the latest
+code. Existing secrets and data are kept.
+
+### Operations
+
+```bash
+curl http://<EC2_PUBLIC_IP>/health                # 200 healthy / 503 database down
+sudo systemctl status taskflow nginx postgresql    # service status
+sudo journalctl -u taskflow -f                     # application + Gunicorn logs
+sudo tail -f /var/log/nginx/access.log             # Nginx access log
+sudo systemctl restart taskflow                    # restart the app
+sudo -u postgres psql taskflow                     # database shell
+```
+
+### Tear down (stops all charges)
+
+```bash
+IID=$(aws ec2 describe-instances --filters Name=tag:Name,Values=taskflow \
+  Name=instance-state-name,Values=running,stopped --query 'Reservations[].Instances[].InstanceId' --output text)
+aws ec2 terminate-instances --instance-ids $IID
+aws ec2 wait instance-terminated --instance-ids $IID
+aws ec2 delete-security-group --group-name taskflow-sg
+aws ec2 delete-key-pair --key-name taskflow-key
+```
+
+Note: without an Elastic IP, the public IP changes if the instance is
+stopped and started (a reboot keeps it). There is no domain, so the site is
+served over HTTP; with a domain, add HTTPS via Let's Encrypt (`certbot --nginx`)
+and set `SESSION_COOKIE_SECURE=true`.
 
 ## Logging
 
