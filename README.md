@@ -1,73 +1,53 @@
 # TaskFlow
 
-A simple, database-driven to-do list web application built with **Flask** and
-**PostgreSQL**, prepared to run under **Gunicorn** behind an **Nginx** reverse proxy.
+A small to-do list web app (create, edit, complete, filter and delete tasks) built
+to demonstrate a production-style deployment on AWS: **Flask** behind **Gunicorn**
+and **Nginx**, with data in **PostgreSQL**, running on a single **EC2** instance.
 
-## Features
-
-- Add, view, edit and delete tasks
-- Mark tasks as completed / pending
-- Priority: Low, Medium, High
-- Filter: All, Pending, Completed
-- Total / pending / completed counters
-- Server-side input validation
-- All data persisted in PostgreSQL
-- `/health` endpoint that checks the app **and** database connectivity
-- Structured logging to stdout, friendly error pages
-
-## Project structure
-
-```
-app/
-  __init__.py          Application factory (config, logging, DB, ProxyFix, error handlers)
-  models.py            Task model (SQLAlchemy)
-  routes.py            UI routes + /health
-  templates/           base.html, index.html, error.html
-  static/css/style.css
-tests/test_app.py      pytest suite (in-memory SQLite, no PostgreSQL required)
-config.py              Settings, all secrets read from environment variables
-run.py                 Entry point (python run.py / gunicorn run:app)
-requirements.txt
-.env.example           Template for your local .env file
-pytest.ini
-deploy/
-  setup_server.sh      One-command server setup / redeploy (Ubuntu 24.04)
-  taskflow.service     systemd unit running Gunicorn
-  nginx-taskflow.conf  Nginx reverse proxy config
-```
+**Live:** http://77.113.88.146 &nbsp;·&nbsp; **Health:** http://77.113.88.146/health
 
 ## Architecture
 
-### Components
-
-How a request travels from the user's browser to PostgreSQL and back:
-
 ```mermaid
 flowchart TB
-    U(["User"]) --> B["Browser<br/>index.html + Bootstrap 5"]
-    B -- "HTTP :80<br/>GET page / POST form" --> N["Nginx<br/>reverse proxy"]
-    N -- "/static/* served<br/>directly from disk" --> B
-    N -- "proxy_pass<br/>+ X-Forwarded-* headers" --> G["Gunicorn<br/>127.0.0.1:8000<br/>2 workers"]
-    G -- "WSGI" --> P
+    User(["User's browser"])
 
-    subgraph FLASK["Flask app (app/)"]
-        direction LR
-        P["ProxyFix<br/>restores client IP + scheme"] --> R["routes.py<br/>Blueprint 'main'"]
-        R --> V["validate_task_form()"]
-        R --> T["Jinja2 templates<br/>base.html, index.html"]
-        R --> M["models.py<br/>Task model"]
+    subgraph AWS["AWS, us-east-2, default VPC"]
+        SG{{"Security group: taskflow-sg<br/>HTTP 80 open, SSH 22 key-only"}}
+        subgraph EC2["EC2 t3.micro, Ubuntu 24.04"]
+            N["Nginx :80<br/>reverse proxy, serves static files"]
+            G["Gunicorn 127.0.0.1:8000<br/>2 workers, managed by systemd"]
+            F["Flask app<br/>routes, validation, HTML templates"]
+            O["SQLAlchemy ORM + psycopg<br/>connection pool"]
+            DB[("PostgreSQL 16<br/>127.0.0.1:5432")]
+        end
+        EBS[("EBS volume<br/>20 GB gp3, encrypted")]
     end
 
-    M -- "SQLAlchemy ORM<br/>(Flask-SQLAlchemy)" --> D["psycopg 3 driver<br/>connection pool + pre-ping"]
-    D -- "SQL over TCP<br/>127.0.0.1:5432" --> DB[("PostgreSQL 16<br/>tasks table")]
+    GH["GitHub repo"]
+
+    User <-- "HTTP :80" --> SG
+    SG <--> N
+    N <-- "proxy_pass +<br/>X-Forwarded-* headers" --> G
+    G <-- "WSGI" --> F
+    F <-- "ORM queries" --> O
+    O <-- "SQL" --> DB
+    DB -. "stores data on" .- EBS
+    GH -. "git clone on deploy" .-> EC2
 ```
 
-### CRUD request lifecycle
+Each arrow is two-way: the request travels down to the database, and the
+response travels back up the same path to the browser. Only Nginx is
+reachable from the internet. Gunicorn and PostgreSQL listen on localhost, so
+the database is never exposed. Nginx serves CSS itself and passes everything
+else to Gunicorn, which runs the Flask app.
 
-Every change uses the **Post/Redirect/Get** pattern: the browser POSTs a form,
-the app writes to the database and answers with a redirect, and the browser
-then GETs the refreshed list. Refreshing the page therefore never submits a
-form twice. Example: adding a task.
+### How a request travels: adding a task
+
+Every change uses the **Post/Redirect/Get** pattern. The browser submits a
+form, the app writes to the database and replies with a redirect, and the
+browser then loads the updated list. Edit, complete and delete work the same
+way.
 
 ```mermaid
 sequenceDiagram
@@ -109,234 +89,121 @@ sequenceDiagram
     Browser-->>User: Updated task list
 ```
 
-Edit, toggle and delete follow the same POST, commit, 302, GET shape; only
-the route and the SQL differ:
+When things go wrong, the user sees a friendly page rather than a stack trace:
 
-| Action           | Browser request            | Route function   | ORM operation                                         | SQL sent to PostgreSQL                         |
-|------------------|----------------------------|------------------|-------------------------------------------------------|------------------------------------------------|
-| View / filter    | `GET /?filter=pending`     | `index()`        | `Task.query.filter_by(completed=False)...all()` + counts | `SELECT ... WHERE completed = false ORDER BY created_at DESC` |
-| Create           | `POST /tasks`              | `create_task()`  | `db.session.add(task)`, `commit()`                    | `INSERT INTO tasks ... RETURNING id`           |
-| Open edit form   | `GET /tasks/<id>/edit`     | `edit_task()`    | `db.get_or_404(Task, id)`                             | `SELECT ... WHERE id = ?`                      |
-| Update           | `POST /tasks/<id>/edit`    | `edit_task()`    | load task, set fields, `commit()`                     | `SELECT` by id, then `UPDATE tasks SET title, description, priority` |
-| Complete/pending | `POST /tasks/<id>/toggle`  | `toggle_task()`  | load task, flip `completed`, `commit()`               | `SELECT` by id, then `UPDATE tasks SET completed` |
-| Delete           | `POST /tasks/<id>/delete`  | `delete_task()`  | load task, `db.session.delete(task)`, `commit()`      | `SELECT` by id, then `DELETE FROM tasks WHERE id = ?` |
+| Situation                        | Response                                                     |
+|----------------------------------|--------------------------------------------------------------|
+| Invalid form input               | 400, form shown again with errors; nothing saved             |
+| Task doesn't exist               | 404                                                          |
+| Database unreachable             | 503, transaction rolled back, error logged                   |
+| `/health` with database down     | 503 `{"status":"unhealthy","database":"down"}`               |
 
-Error paths:
+## Design decisions
 
-- **Invalid input** (empty or too-long title, unknown priority): HTTP 400; the
-  form is shown again with the errors and nothing is written.
-- **Unknown task id**: `db.get_or_404` returns HTTP 404 (`error.html`).
-- **GET on a write route** (e.g. opening `/tasks/1/delete` in the address bar): HTTP 405.
-- **Database unavailable or query failure**: the `SQLAlchemyError` handler
-  rolls back the session, logs the error and returns HTTP 503 (`error.html`).
-- **Delete** asks for confirmation in the browser (`confirm()`) before the form is submitted.
+- **One EC2 instance, PostgreSQL on the same host.** This is the simplest
+  and cheapest setup that meets the requirements (free-tier eligible, three
+  AWS resources in total). The trade-off is no managed backups and no
+  failover. The app reads its database location from environment variables,
+  so moving to RDS later means changing configuration, not code.
+- **Minimal attack surface.** Only ports 80 and 22 are open. Gunicorn and
+  PostgreSQL listen on localhost. The app runs as an unprivileged `taskflow`
+  user. SSH accepts key-based logins only. PostgreSQL requires a password.
+- **No secrets in git.** All configuration comes from environment
+  variables. On the server, the deploy script generates the secret key and
+  database password itself and stores them in a root-owned file
+  (`/etc/taskflow/taskflow.env`).
+- **Self-healing.** systemd starts Nginx, the app and PostgreSQL at boot and
+  restarts the app if it crashes. The app checks each pooled connection
+  before use, so it recovers from a database restart without being
+  restarted itself. It also starts while the database is down and reports
+  that through `/health`.
+- **Observable.** `/health` checks both the app and database connectivity,
+  ready for an uptime monitor or a load balancer health check. Application
+  logs go to stdout and are collected by journald. Nginx keeps its own access
+  log.
+- **Persistent data.** PostgreSQL stores its data on the EBS volume, so tasks
+  survive app restarts, database restarts and instance reboots. All three
+  were tested.
 
-## Database schema
+## Running locally
 
-Table `tasks` (created automatically on startup):
-
-| Column        | Type                      | Notes                                 |
-|---------------|---------------------------|---------------------------------------|
-| `id`          | integer, primary key      |                                       |
-| `title`       | varchar(200), not null    |                                       |
-| `description` | text, nullable            | max 1000 chars (validated)            |
-| `priority`    | varchar(10), not null     | `Low` / `Medium` / `High` (CHECK)     |
-| `completed`   | boolean, not null         | default `false`                       |
-| `created_at`  | timestamptz, not null     | set automatically (UTC)               |
-
----
-
-## Run locally (macOS)
-
-### 1. Install and start PostgreSQL
-
-```bash
-brew install postgresql@16
-brew services start postgresql@16          # starts now and on every login
-echo 'export PATH="/opt/homebrew/opt/postgresql@16/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-### 2. Create the database and user
+Requires Python 3.9+ and PostgreSQL. On macOS:
 
 ```bash
-psql postgres -c "CREATE USER taskflow WITH PASSWORD 'choose-a-strong-password';"
+brew install postgresql@16 && brew services start postgresql@16
+export PATH="/opt/homebrew/opt/postgresql@16/bin:$PATH"
+psql postgres -c "CREATE USER taskflow WITH PASSWORD 'change-me';"
 psql postgres -c "CREATE DATABASE taskflow OWNER taskflow;"
-```
 
-### 3. Set up Python
-
-```bash
-cd /path/to/project
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env            # set SECRET_KEY and DB_PASSWORD
+python run.py                   # http://127.0.0.1:5000
 ```
 
-### 4. Configure environment variables
+The `tasks` table is created automatically on startup. To run it the way
+production does, use `gunicorn --bind 127.0.0.1:8000 run:app`.
+
+**Tests:** `pytest` runs 21 tests against an in-memory SQLite database, so
+PostgreSQL isn't needed. They cover CRUD, validation, filters, error
+handling, and the health check, including a simulated database outage.
+
+## How it was deployed
+
+1. **Provisioned the infrastructure** with the AWS CLI in `us-east-2`:
+
+   | Resource       | Configuration                                                     |
+   |----------------|-------------------------------------------------------------------|
+   | EC2 instance   | t3.micro, Ubuntu 24.04, 20 GB encrypted gp3 EBS, IMDSv2 required |
+   | Security group | `taskflow-sg`: HTTP 80 from anywhere, SSH 22 from anywhere        |
+   | Key pair       | `taskflow-key`, used for SSH                                      |
+
+   No RDS, load balancer or Elastic IP were needed.
+
+2. **Configured the server** by running one idempotent script over SSH,
+   [`deploy/setup_server.sh`](deploy/setup_server.sh). It installs
+   PostgreSQL, Nginx and Python, clones this repository, generates the
+   secrets, creates the database, and installs the
+   [systemd service](deploy/taskflow.service) and
+   [Nginx config](deploy/nginx-taskflow.conf). It finishes by checking
+   `/health`.
+
+3. **Verified it end to end** against the public URL. All CRUD actions
+   worked. Stopping PostgreSQL made `/health` return 503, and it recovered
+   to 200 without restarting the app. Tasks survived both an app restart
+   and a full instance reboot.
+
+**Redeploy** after pushing changes: SSH in and run the same script again. It
+pulls the latest code and keeps the existing secrets and data.
 
 ```bash
-cp .env.example .env
-python3 -c "import secrets; print(secrets.token_hex(32))"   # paste into SECRET_KEY
-# edit .env: set SECRET_KEY and DB_PASSWORD
+ssh -i ~/.ssh/taskflow-key.pem ubuntu@77.113.88.146
+curl -fsSL https://raw.githubusercontent.com/Jinal-Thummar/mangoapps/main/deploy/setup_server.sh -o setup_server.sh
+REPO_URL=https://github.com/Jinal-Thummar/mangoapps.git bash setup_server.sh
 ```
 
-`.env` is git-ignored. In production, set the same variables through the
-process manager (e.g. a systemd `EnvironmentFile`) instead of a `.env` file.
+**Useful commands on the server:** `sudo journalctl -u taskflow -f` (app
+logs), `sudo systemctl status taskflow nginx postgresql` (service status),
+`sudo systemctl restart taskflow` (restart the app).
 
-### 5. Run
-
-Development server (auto-reload, debug):
+<details>
+<summary>AWS CLI commands used to provision the infrastructure</summary>
 
 ```bash
-python run.py
-# open http://127.0.0.1:5000
-```
-
-With Gunicorn (how it runs in production):
-
-```bash
-gunicorn --bind 127.0.0.1:8000 --workers 3 --access-logfile - --error-logfile - run:app
-# open http://127.0.0.1:8000
-```
-
-Tables are created automatically on startup. If PostgreSQL was down when the
-app started, create them later with:
-
-```bash
-flask --app run init-db
-```
-
----
-
-## Testing
-
-### Automated tests
-
-```bash
-source .venv/bin/activate
-pytest -v
-```
-
-Tests use an in-memory SQLite database, so they run without PostgreSQL. They
-cover CRUD, validation, filters, counters, 404/405 handling and the health
-check (including a simulated database outage returning 503).
-
-### Health check
-
-```bash
-curl -i http://127.0.0.1:5000/health
-# HTTP/1.1 200 OK
-# {"application":"up","database":"up","status":"healthy"}
-```
-
-Simulate a database outage:
-
-```bash
-# "fast" shutdown closes the app's open connections, like a real outage.
-# (A plain `brew services stop` waits for clients to disconnect first.)
-brew services stop postgresql@16
-pg_ctl -D /opt/homebrew/var/postgresql@16 stop -m fast
-curl -i http://127.0.0.1:5000/health     # HTTP/1.1 503 SERVICE UNAVAILABLE
-brew services start postgresql@16
-curl -i http://127.0.0.1:5000/health     # back to 200 (connections are re-checked automatically)
-```
-
-### Data persistence
-
-1. Add a few tasks in the browser.
-2. Stop the app (`Ctrl+C`) and start it again.
-3. Reload the page: the tasks are still there, because they are stored in PostgreSQL.
-
-You can also inspect the data directly:
-
-```bash
-psql -U taskflow -h localhost taskflow -c "SELECT id, title, priority, completed, created_at FROM tasks;"
-```
-
----
-
-## Environment variables
-
-| Variable                | Required | Default      | Description                                  |
-|-------------------------|----------|--------------|----------------------------------------------|
-| `APP_ENV`               | no       | `production` | `development` or `production`                |
-| `SECRET_KEY`            | yes*     | —            | Flask session signing key (*random in dev)   |
-| `DATABASE_URL`          | no       | —            | Full Postgres URL; overrides the `DB_*` vars |
-| `DB_HOST`               | no       | `localhost`  |                                              |
-| `DB_PORT`               | no       | `5432`       |                                              |
-| `DB_NAME`               | no       | `taskflow`   |                                              |
-| `DB_USER`               | no       | `taskflow`   |                                              |
-| `DB_PASSWORD`           | yes      | —            |                                              |
-| `DB_CONNECT_TIMEOUT`    | no       | `5`          | Seconds before a DB connection attempt fails |
-| `LOG_LEVEL`             | no       | `INFO`       |                                              |
-| `SESSION_COOKIE_SECURE` | no       | `false`      | Set `true` when served over HTTPS            |
-
----
-
-## AWS deployment (single EC2 instance)
-
-### Architecture
-
-```
-Internet ──► Security group (80 open, 22 open: SSH key-only)
-               │
-               ▼
-        EC2 t3.micro · Ubuntu 24.04
-        ┌──────────────────────────────────────────┐
-        │ Nginx :80  ──►  Gunicorn 127.0.0.1:8000   │
-        │ (static files,     (systemd: taskflow,     │
-        │  security headers)  2 workers, user        │
-        │                     `taskflow`)            │
-        │                        │                   │
-        │                        ▼                   │
-        │            PostgreSQL 16 127.0.0.1:5432    │
-        │            (data on encrypted EBS volume)  │
-        └──────────────────────────────────────────┘
-```
-
-AWS resources: **1 EC2 instance, 1 security group, 1 key pair.** No RDS,
-load balancer or Elastic IP.
-
-- Gunicorn and PostgreSQL listen on localhost only; Nginx is the only public
-  service. The app uses Werkzeug's `ProxyFix` to trust Nginx's
-  `X-Forwarded-*` headers (one proxy hop).
-- Secrets (`SECRET_KEY`, DB password) are generated **on the server** by
-  `setup_server.sh` and stored in `/etc/taskflow/taskflow.env`
-  (`root:taskflow`, mode 640). They are never in git.
-- PostgreSQL uses password (`scram-sha-256`) authentication.
-- SSH (port 22) is open to any IP so the server can be managed from any
-  network. sshd accepts **key-based logins only** (password and root password
-  login are disabled in the Ubuntu AMI), so access requires
-  `taskflow-key.pem`. Automated scanners will hit port 22 and fail; these
-  attempts show up in `journalctl -u ssh`. For tighter security, restrict the
-  rule to your own IP (`CidrIp=<your-ip>/32`).
-- `postgresql`, `taskflow` and `nginx` are enabled systemd services, so
-  everything starts automatically after a reboot; Gunicorn restarts on crash.
-- Data lives on the instance's EBS volume and survives app restarts,
-  database restarts and instance reboots.
-
-### Create the infrastructure (AWS CLI)
-
-```bash
-REGION=us-east-2
 VPC=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text)
 AMI=$(aws ec2 describe-images --owners 099720109477 \
   --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
   --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)
 
-# Key pair (skip if you already have one)
 aws ec2 create-key-pair --key-name taskflow-key --query KeyMaterial --output text > ~/.ssh/taskflow-key.pem
 chmod 400 ~/.ssh/taskflow-key.pem
 
-# Security group: SSH and HTTP from anywhere (SSH is key-only on the server)
 SG=$(aws ec2 create-security-group --group-name taskflow-sg \
   --description "TaskFlow web server" --vpc-id $VPC --query GroupId --output text)
 aws ec2 authorize-security-group-ingress --group-id $SG --ip-permissions \
   "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=0.0.0.0/0}]" \
   "IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0}]"
 
-# EC2 instance (encrypted 20 GB gp3 disk, IMDSv2 required)
 aws ec2 run-instances --image-id $AMI --instance-type t3.micro --key-name taskflow-key \
   --security-group-ids $SG \
   --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","Encrypted":true}}]' \
@@ -344,29 +211,12 @@ aws ec2 run-instances --image-id $AMI --instance-type t3.micro --key-name taskfl
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=taskflow}]'
 ```
 
-### Deploy / redeploy
+</details>
 
-```bash
-ssh -i ~/.ssh/taskflow-key.pem ubuntu@<EC2_PUBLIC_IP>
-curl -fsSL https://raw.githubusercontent.com/Jinal-Thummar/mangoapps/main/deploy/setup_server.sh -o setup_server.sh
-REPO_URL=https://github.com/Jinal-Thummar/mangoapps.git bash setup_server.sh
-```
+<details>
+<summary>Tearing it down</summary>
 
-The script is idempotent: run it again after `git push` to deploy the latest
-code. Existing secrets and data are kept.
-
-### Operations
-
-```bash
-curl http://<EC2_PUBLIC_IP>/health                # 200 healthy / 503 database down
-sudo systemctl status taskflow nginx postgresql    # service status
-sudo journalctl -u taskflow -f                     # application + Gunicorn logs
-sudo tail -f /var/log/nginx/access.log             # Nginx access log
-sudo systemctl restart taskflow                    # restart the app
-sudo -u postgres psql taskflow                     # database shell
-```
-
-### Tear down (stops all charges)
+Terminating the instance also deletes its EBS volume and all task data.
 
 ```bash
 IID=$(aws ec2 describe-instances --filters Name=tag:Name,Values=taskflow \
@@ -377,22 +227,25 @@ aws ec2 delete-security-group --group-name taskflow-sg
 aws ec2 delete-key-pair --key-name taskflow-key
 ```
 
-Note: without an Elastic IP, the public IP changes if the instance is
-stopped and started (a reboot keeps it). There is no domain, so the site is
-served over HTTP; with a domain, add HTTPS via Let's Encrypt (`certbot --nginx`)
-and set `SESSION_COOKIE_SECURE=true`.
+</details>
 
-## Logging
+## Limitations and next steps
 
-Application logs go to **stdout** in the format
-`timestamp [LEVEL] app: message`. Under Gunicorn, add `--access-logfile -`
-and `--error-logfile -` so everything lands in one stream, which systemd and
-journald collect automatically.
+| Limitation                                    | Next step                                                   |
+|-----------------------------------------------|-------------------------------------------------------------|
+| HTTP only (no domain)                         | Add a domain and HTTPS via Let's Encrypt (`certbot --nginx`) |
+| No database backups                           | Scheduled EBS snapshots, or move to RDS with automated backups |
+| Single instance, no failover                  | Load balancer + Auto Scaling group + RDS                     |
+| Public IP changes if the instance is stopped  | Elastic IP or a DNS record                                   |
+| SSH open to all IPs (key-only)                | Restrict to admin IPs, or use SSM Session Manager            |
+| No user accounts or CSRF protection           | Add authentication and Flask-WTF before real use             |
 
-## Notes
+## Project layout
 
-- Normal database operations use the SQLAlchemy ORM. The only raw SQL is
-  `SELECT 1` in the health check.
-- No credentials are stored in the source code.
-- The app has no authentication or CSRF protection (out of scope for this
-  assessment). Add Flask-WTF/CSRF before exposing it publicly.
+```
+app/          Flask application: factory, model, routes, templates, CSS
+tests/        pytest suite
+deploy/       Server setup script, systemd unit, Nginx config
+config.py     Settings, read from environment variables (see .env.example)
+run.py        Entry point for `python run.py` and `gunicorn run:app`
+```
