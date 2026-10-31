@@ -1,0 +1,117 @@
+/* TaskFlow - minimal styling on top of Bootstrap 5 */
+
+body {
+  background-color: #ffffff;
+  color: #212529;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+/* Brand */
+.brand-mark {
+  display: inline-block;
+  background: #0d6efd;
+  color: #fff;
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 0.8rem;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+/* Cards / panels */
+.panel {
+  border-color: #e9ecef;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+.panel .card-header {
+  border-bottom-color: #e9ecef;
+}
+
+/* Summary counters */
+.stat-card {
+  background: #f8f9fa;
+  border: 1px solid #e9ecef;
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.stat-label {
+  font-size: 0.8rem;
+  color: #6c757d;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.stat-value {
+  font-size: 1.75rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+/* Filter tabs */
+.nav-sm .nav-link {
+  padding: 0.25rem 0.75rem;
+  font-size: 0.875rem;
+}
+
+/* Task list */
+.task-item {
+  padding-top: 0.875rem;
+  padding-bottom: 0.875rem;
+}
+
+.task-title {
+  font-weight: 500;
+  word-break: break-word;
+}
+
+.task-desc {
+  color: #495057;
+  font-size: 0.925rem;
+  white-space: pre-line;
+  word-break: break-word;
+  margin-top: 0.25rem;
+}
+
+.task-done .task-title {
+  text-decoration: line-through;
+  color: #6c757d;
+}
+
+.toggle-btn {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  line-height: 1;
+}
+
+.min-w-0 {
+  min-width: 0;
+}
+
+/* Priority badges */
+.priority-low {
+  background-color: #e7f1ff;
+  color: #0a58ca;
+}
+
+.priority-medium {
+  background-color: #fff3cd;
+  color: #997404;
+}
+
+.priority-high {
+  background-color: #f8d7da;
+  color: #b02a37;
+}
+
+/* Small screens: stack action buttons under the task */
+@media (max-width: 576px) {
+  .task-item .d-flex.align-items-start {
+    flex-wrap: wrap;
+  }
+  .stat-value {
+    font-size: 1.4rem;
+  }
+}

@@ -1,0 +1,16 @@
+# Web framework
+Flask==3.1.3
+Flask-SQLAlchemy==3.1.1
+SQLAlchemy==2.0.55
+
+# PostgreSQL driver (psycopg 3; the [binary] extra ships a prebuilt libpq)
+psycopg[binary]==3.2.13
+
+# Production WSGI server
+gunicorn==23.0.0
+
+# Loads variables from a local .env file
+python-dotenv==1.2.1
+
+# Testing
+pytest==8.4.2

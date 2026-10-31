@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+
+{% block content %}
+{# ---------- Summary counts ---------- #}
+<div class="row g-3 mb-4">
+  <div class="col-4">
+    <div class="stat-card">
+      <div class="stat-label">Total</div>
+      <div class="stat-value">{{ counts.total }}</div>
+    </div>
+  </div>
+  <div class="col-4">
+    <div class="stat-card">
+      <div class="stat-label">Pending</div>
+      <div class="stat-value text-warning-emphasis">{{ counts.pending }}</div>
+    </div>
+  </div>
+  <div class="col-4">
+    <div class="stat-card">
+      <div class="stat-label">Completed</div>
+      <div class="stat-value text-success">{{ counts.completed }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-4">
+  {# ---------- Add / Edit form ---------- #}
+  <div class="col-lg-4">
+    <div class="card panel">
+      <div class="card-header bg-light fw-semibold">
+        {{ "Edit task" if edit_task else "Add a task" }}
+      </div>
+      <div class="card-body">
+        {% if errors %}
+          <div class="alert alert-danger py-2" role="alert">
+            <ul class="mb-0 ps-3">
+              {% for error in errors %}<li>{{ error }}</li>{% endfor %}
+            </ul>
+          </div>
+        {% endif %}
+
+        <form method="post"
+              action="{{ url_for('main.edit_task', task_id=edit_task.id) if edit_task else url_for('main.create_task') }}">
+          <input type="hidden" name="filter" value="{{ current_filter }}">
+
+          <div class="mb-3">
+            <label for="title" class="form-label">Title <span class="text-danger">*</span></label>
+            <input type="text" class="form-control" id="title" name="title"
+                   value="{{ form.title }}" maxlength="{{ title_max }}" required
+                   placeholder="What needs to be done?">
+          </div>
+
+          <div class="mb-3">
+            <label for="description" class="form-label">Description</label>
+            <textarea class="form-control" id="description" name="description" rows="3"
+                      maxlength="{{ description_max }}"
+                      placeholder="Optional details">{{ form.description }}</textarea>
+          </div>
+
+          <div class="mb-3">
+            <label for="priority" class="form-label">Priority</label>
+            <select class="form-select" id="priority" name="priority">
+              {% for p in priorities %}
+                <option value="{{ p }}" {% if form.priority == p %}selected{% endif %}>{{ p }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="d-flex gap-2">
+            <button type="submit" class="btn btn-primary flex-grow-1">
+              {{ "Save changes" if edit_task else "Add task" }}
+            </button>
+            {% if edit_task %}
+              <a href="{{ url_for('main.index', filter=current_filter) }}" class="btn btn-outline-secondary">Cancel</a>
+            {% endif %}
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  {# ---------- Task list ---------- #}
+  <div class="col-lg-8">
+    <div class="card panel">
+      <div class="card-header bg-light d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <span class="fw-semibold">Tasks</span>
+        <ul class="nav nav-pills nav-sm">
+          {% for name, label, count in [("all", "All", counts.total),
+                                         ("pending", "Pending", counts.pending),
+                                         ("completed", "Completed", counts.completed)] %}
+            <li class="nav-item">
+              <a class="nav-link {% if current_filter == name %}active{% endif %}"
+                 href="{{ url_for('main.index', filter=name) }}">
+                {{ label }} <span class="badge text-bg-light border">{{ count }}</span>
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+
+      {% if tasks %}
+        <ul class="list-group list-group-flush">
+          {% for task in tasks %}
+            <li class="list-group-item task-item {% if task.completed %}task-done{% endif %}">
+              <div class="d-flex align-items-start gap-3">
+                {# Toggle completed / pending #}
+                <form method="post" action="{{ url_for('main.toggle_task', task_id=task.id) }}">
+                  <input type="hidden" name="filter" value="{{ current_filter }}">
+                  <button type="submit"
+                          class="btn btn-sm {{ 'btn-success' if task.completed else 'btn-outline-secondary' }} toggle-btn"
+                          title="{{ 'Mark as pending' if task.completed else 'Mark as completed' }}"
+                          aria-label="{{ 'Mark as pending' if task.completed else 'Mark as completed' }}">
+                    &#10003;
+                  </button>
+                </form>
+
+                <div class="flex-grow-1 min-w-0">
+                  <div class="d-flex flex-wrap align-items-center gap-2">
+                    <span class="task-title">{{ task.title }}</span>
+                    <span class="badge priority-{{ task.priority | lower }}">{{ task.priority }}</span>
+                    {% if task.completed %}
+                      <span class="badge text-bg-success-subtle text-success-emphasis">Completed</span>
+                    {% else %}
+                      <span class="badge text-bg-light border">Pending</span>
+                    {% endif %}
+                  </div>
+                  {% if task.description %}
+                    <p class="task-desc mb-1">{{ task.description }}</p>
+                  {% endif %}
+                  <small class="text-muted">Created {{ task.created_at.strftime('%b %d, %Y %H:%M') }} UTC</small>
+                </div>
+
+                <div class="d-flex gap-1 flex-shrink-0">
+                  <a href="{{ url_for('main.edit_task', task_id=task.id, filter=current_filter) }}"
+                     class="btn btn-sm btn-outline-primary">Edit</a>
+                  <form method="post" action="{{ url_for('main.delete_task', task_id=task.id) }}"
+                        onsubmit="return confirm('Delete this task?');">
+                    <input type="hidden" name="filter" value="{{ current_filter }}">
+                    <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+                  </form>
+                </div>
+              </div>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="card-body text-center text-muted py-5">
+          {% if current_filter == "all" %}
+            No tasks yet. Add your first task using the form.
+          {% else %}
+            No {{ current_filter }} tasks.
+          {% endif %}
+        </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
