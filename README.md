@@ -134,7 +134,10 @@ curl -i http://127.0.0.1:5000/health
 Simulate a database outage:
 
 ```bash
+# "fast" shutdown closes the app's open connections, like a real outage.
+# (A plain `brew services stop` waits for clients to disconnect first.)
 brew services stop postgresql@16
+pg_ctl -D /opt/homebrew/var/postgresql@16 stop -m fast
 curl -i http://127.0.0.1:5000/health     # HTTP/1.1 503 SERVICE UNAVAILABLE
 brew services start postgresql@16
 curl -i http://127.0.0.1:5000/health     # back to 200 (connections are re-checked automatically)

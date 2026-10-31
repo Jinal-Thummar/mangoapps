@@ -1,0 +1,34 @@
+# systemd unit for TaskFlow: runs Gunicorn as an unprivileged user,
+# starts on boot and restarts automatically if it crashes.
+# Installed to /etc/systemd/system/taskflow.service by setup_server.sh.
+
+[Unit]
+Description=TaskFlow Flask app (Gunicorn)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+User=taskflow
+Group=taskflow
+WorkingDirectory=/opt/taskflow
+# Secrets (SECRET_KEY, DB_PASSWORD, ...) live only on the server, never in git.
+EnvironmentFile=/etc/taskflow/taskflow.env
+# Listen on localhost only: Nginx is the single public entry point.
+ExecStart=/opt/taskflow/.venv/bin/gunicorn \
+    --bind 127.0.0.1:8000 \
+    --workers 2 \
+    --timeout 30 \
+    --access-logfile - \
+    --error-logfile - \
+    run:app
+Restart=always
+RestartSec=5
+
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
